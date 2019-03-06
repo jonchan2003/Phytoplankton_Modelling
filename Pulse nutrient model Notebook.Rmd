@@ -1,0 +1,355 @@
+---
+title: "Pulse Nutrient Model for Phytoplankton"
+output: html_notebook
+---
+The aim of the model is to study how temperature changes affect size dynamics of phytoplankton populations in a pulse nutrient environment. We have done this by combining the temperature and size model used in "Reuman, D. C., Holt, R. D. and Yvon-Durocher, G. (2014), A metabolic perspective on competition and body size reductions with warming. J Anim Ecol, 83: 59-69. doi:10.1111/1365-2656.12064" with the pulse nurtrient and size model used in "Litchman E, Klausmeier CA, Yoshiyama K. Contrasting size evolution in marine and freshwater diatoms. Proc Natl Acad Sci U S A. 2009;106(8):2665-70."
+
+```{r message=FALSE}
+library(deSolve)
+library(Rcpp)
+library(parallel)
+library(CmodelRHS2)
+library(microbenchmark)
+```
+Initiliasing the model parameters. Converts cell sizes, temperature and metaparms to dynamical model parameters Qmin, Qmax etc. 
+```{r}
+rm(list=ls())  # remove any prior variable
+k <- 8.6173324e-05    # Global constant: Boltzmann's constant
+
+dynamic_parms <- function(s, metaparms){
+  with(as.list(metaparms),{
+    Qmin   <- kQmin*(s^eQmin*exp(EQmin*(T-T0)/(k*T*T0)))
+    Qmax   <- kQmax*s^eQmax*exp(EQmax*(T-T0)/(k*T*T0))
+    Vmax   <- kVmax*s^eVmax*exp((EVmax*(T-T0))/(k*T*T0))
+    mu_max <- kmu_max*(exp((Emu_max*(T-T0))/(k*T*T0))*(s^emu_max))
+    mu_inf <- (mu_max*Vmax*Qmax)/((Vmax*(Qmax-Qmin))-(mu_max*Qmin*(Qmax-Qmin)))
+    m      <- km*(s^em)*exp((Em*(T-T0))/(k*T*T0))
+    H_up   <- (kH_up*s^eH_up*exp(EH_up*(T-T0)/(k*T*T0)))/T 
+    return(c(Qmin=Qmin, Qmax=Qmax, Vmax=Vmax, mu_inf=mu_inf, H_up=H_up, m=m))
+  })
+} 
+```
+
+## Phytoplankton growth model
+ModelRHS is the func argument to LSODA that contains five differntial equations used to derive the changes in population, interal nutrient quota and external nutrient concentration. parms is not used in this case and is merely there to satisfy the requirment of lsoda, instead parms is split into d_parms_i & j and is passed as additional arguments, y is a list containing the current state of the system.
+
+The ModelRHS function below is provided for reference, & can be used in case of compatability issues with the Rcpp code.
+```{r}
+ModelRHS <- function(time, y, parms, d_parms_i, d_parms_j){
+
+  dN_dt_i <- (y['N_i']*(d_parms_i['mu_inf']*(1-(d_parms_i['Qmin']/y['Q_i']))-d_parms_i['m']))
+  dN_dt_j <- (y['N_j']*(d_parms_j['mu_inf']*(1-(d_parms_j['Qmin']/y['Q_j']))-d_parms_j['m']))
+
+  dQ_dt_i <- ((d_parms_i['Vmax']*((d_parms_i['Qmax']-y['Q_i'])/(d_parms_i['Qmax']-d_parms_i['Qmin']))
+                  *(y['R']/(y['R']+d_parms_i['H_up'])))
+                 -(d_parms_i['mu_inf']*(1-(d_parms_i['Qmin']/y['Q_i']))*y['Q_i']))
+  dQ_dt_j <- ((d_parms_j['Vmax']*((d_parms_j['Qmax']-y['Q_j'])/(d_parms_j['Qmax']-d_parms_j['Qmin']))
+                  *(y['R']/(y['R']+d_parms_j['H_up'])))
+                -(d_parms_j['mu_inf']*(1-(d_parms_j['Qmin']/y['Q_j']))*y['Q_j']))
+  
+  dR_dt   <- (-(d_parms_i['Vmax']*((d_parms_i['Qmax']-y['Q_i'])/(d_parms_i['Qmax']-d_parms_i['Qmin']))
+                *((y['R']*y['N_i'])/(y['R']+d_parms_i['H_up'])))
+              -(d_parms_j['Vmax']*((d_parms_j['Qmax']-y['Q_j'])/(d_parms_j['Qmax']-d_parms_j['Qmin']))
+                *((y['R']*y['N_j'])/(y['R']+d_parms_j['H_up']))))
+  res <- c(dN_dt_i, dN_dt_j, dQ_dt_i, dQ_dt_j, dR_dt)
+  return(list(res))
+}
+```
+Below is the ModelRHS function coded in C++, using the Rcpp package the code is compiled and available as an R function in the CmodelRHS package. The C++ code is much faster than the R code, and looking at benchmarks (shown later) it provides a 6x increase in speed of the lsoda function
+Note that in C++ code the first value in the vector is stored in [0] and not [1]
+
+structure of d_parms_(i/j):  
+[0] - Qmin  
+[1] - Qmax  
+[2] - Vmax  
+[3] - mu_inf  
+[4] - H_up  
+[5] - m  
+
+structure of y:  
+[0] - N_i  
+[1] - N_j  
+[2] - Q_i  
+[3] - Q_j  
+[4] - R     
+Rcpp::NumericVector is special variables created by Rcpp not available in normal C++ code, mimics the R vector variable
+The Rcpp code is callable below, but future functions use the same function contained in a package form.
+```{Rcpp}
+#include <Rcpp.h>
+using namespace Rcpp;
+// [[Rcpp::export]]
+SEXP rcpp_ModelRHS_local(SEXP timesexp, SEXP ysexp, SEXP parmssexp, SEXP d_parms_isexp, SEXP d_parms_jsexp){
+    Rcpp::NumericVector y(ysexp);
+    Rcpp::NumericVector d_parms_i(d_parms_isexp);
+    Rcpp::NumericVector d_parms_j(d_parms_jsexp);
+    
+    double N_i = (y[0]*(d_parms_i[3]*(1-(d_parms_i[0]/y[2]))-d_parms_i[5]));
+    double N_j = (y[1]*(d_parms_j[3]*(1-(d_parms_j[0]/y[3]))-d_parms_j[5]));
+
+    double Q_i = ((d_parms_i[2]*((d_parms_i[1]-y[2])/(d_parms_i[1]-d_parms_i[0]))
+                   *(y[4]/(y[4]+d_parms_i[4])))
+                  -(d_parms_i[3]*(1-(d_parms_i[0]/y[2]))*y[2]));
+    double Q_j = ((d_parms_j[2]*((d_parms_j[1]-y[3])/(d_parms_j[1]-d_parms_j[0]))
+                   *(y[4]/(y[4]+d_parms_j[4])))
+                -(d_parms_j[3]*(1-(d_parms_j[0]/y[3]))*y[3]));
+
+    double R   = (-(d_parms_i[2]*((d_parms_i[1]-y[2])/(d_parms_i[1]-d_parms_i[0]))
+                    *((y[4]*y[0])/(y[4]+d_parms_i[4])))
+                 -(d_parms_j[2]*((d_parms_j[1]-y[3])/(d_parms_j[1]-d_parms_j[0]))
+                  *((y[4]*y[1])/(y[4]+d_parms_j[4]))));
+
+    return Rcpp::List::create(Rcpp::NumericVector::create(Rcpp::Named("N_i", N_i), 
+                                                          Rcpp::Named("N_j", N_j), 
+                                                          Rcpp::Named("Q_i", Q_i), 
+                                                          Rcpp::Named("Q_j", Q_j), 
+                                                          Rcpp::Named("R", R)));
+}
+```
+## Pulse nutrient model
+During Pulse you get mixing occur according to the model from Litchman et al (2009): nutrient concentration post mix = (fraction of water not mixed * nutrient concentration pre mix) + nurtrient influx during mix popultaion density post mix = fraction of water not mixed * population desntiy pre mix
+```{r}
+Pulse <- function(fraction_replaced, R_in, last_res){
+  Ni_post  <- (1-fraction_replaced)*last_res[2]
+  Nj_post  <- (1-fraction_replaced)*last_res[3]  
+  R_post   <- ((1-fraction_replaced)*last_res[6])+(fraction_replaced*R_in) 
+  post_mix <- c(time=last_res[1], N_i=Ni_post, N_j=Nj_post, Q_i=last_res[4], Q_j=last_res[5], R=R_post)
+  return(post_mix)   
+}
+```
+
+Defining the function that runs the entire simulation 
+```{r}
+# Runs the entire simulation once for a pair of sizes and a single pulse period 
+Model_sim <- function(metaparms, size_of_i, size_of_j, ini_cond, fraction_replaced, R_in,
+                      pulse_period, output_folder_name, out_times) {
+  dir_i <- paste(getwd(),output_folder_name, "/", sep="")
+  dir.create(file.path(dir_i), showWarnings=FALSE, recursive=TRUE)
+  setwd(file.path(dir_i))
+  # dir   <- paste("si=", size_of_i, ", sj=", size_of_j, sep="")  # use this code to place in seperate folders dictated by their sizes
+  # dir.create(file.path(dir), showWarnings = FALSE, recursive = TRUE)
+  # setwd(file.path(dir))
+
+  end_time  <- tail(out_times, n=1)
+  d_parms_i <- dynamic_parms(size_of_i, metaparms)
+  d_parms_j <- dynamic_parms(size_of_j, metaparms)
+  ini_cond["Q_i"] <- median(d_parms_i["Qmax"], d_parms_i["Qmin"])  # to make sure that Q_i & Q_j are within the boundaries of Qmax & Qmin. 
+  ini_cond["Q_j"] <- median(d_parms_j["Qmax"], d_parms_j["Qmin"])  # Uses a value in between the two.
+
+#  initialisation with the first run
+  times     <- c(0, subset(out_times, out_times > 0 & out_times < pulse_period), pulse_period)  # only the beginning, end and all stated out times 
+  results   <- lsoda(y=ini_cond, times=times, func=CmodelRHS2::rcpp_ModelRHS, parms=0, d_parms_i=d_parms_i, d_parms_j=d_parms_j)
+  if(length(results[results[,"time"] %in% out_times, ]) != 0){  # determines if there are any values present in out times
+    temp_res  <- results[-nrow(results), ]
+    total     <- temp_res[temp_res[,"time"] %in% out_times, ] # stores only the results that are within out_times
+    sum_total <- total
+  } else {
+    sum_total <- NULL  # if there are not values stores a NULL value as placeholder
+  }
+  time      <- tail(times, n=1)
+  
+# Loop that runs through the rest of the times after initial first run 
+  while(time < end_time){
+    times   <- c(time, subset(out_times, out_times > time & out_times < (time+pulse_period)), (time+pulse_period))
+    results[nrow(results),] <- Pulse(fraction_replaced, R_in, tail(results, n=1))
+    results <- lsoda(y=results[nrow(results),-1], times=times, func=CmodelRHS2::rcpp_ModelRHS, parms=0, d_parms_i=d_parms_i, d_parms_j=d_parms_j)
+    if(length(results[results[,"time"] %in% out_times, ]) != 0){
+      temp_res  <- results 
+      total     <- temp_res[temp_res[,"time"] %in% out_times, ]
+      sum_total <- rbind(sum_total, total) 
+    }
+    time    <- tail(times, n=1)
+  } 
+  sum_total <- sum_total[which(!duplicated(sum_total[ ,1], fromLast = TRUE)), ]  # gets rid of all results pre-pulse keeps only post-pulse in
+  write.csv(sum_total, file=paste("Results, si=", size_of_i, ", sj=", size_of_j, ", pulse=", pulse_period, ".csv", sep=""))
+  return(sum_total)
+}
+```
+
+Two variants of plot function Plot_pop for only population plots and Plot_all for population, internal nutrient quota & external nutrient quota
+```{r}
+Plot_pop <- function(total, size_of_i, size_of_j, pulse_period, plot_start, plot_end){
+  jpeg (paste("si=", size_of_i, ", sj=", size_of_j,", pulse period=", pulse_period,".jpeg", sep=""), width=9600, height=5400, pointsize=80) 
+  
+  if (plot_end == 0){
+    par(mfrow = c(1,2))
+    plot(total[,1], total[,2], type="l", main=paste("Population Density of i, pulse period=(",pulse_period,")"), 
+         xlab="time(days)", ylab="Number of cells L-1")
+    plot(total[,1], total[,3], type="l", main=paste("Population Density of j, pulse period=(",pulse_period,")"), 
+         xlab="time(days)", ylab="Number of cells L-1")
+  } else {
+    par(mfrow = c(1,2))
+    plot(total[plot_start:plot_end,1], total[plot_start:plot_end,2], type="l", 
+         main=paste("Population Density of i, pulse period=(",pulse_period,")"), xlab="time(days)", ylab="Number of cells L-1")
+    plot(total[plot_start:plot_end,1], total[plot_start:plot_end,3], type="l", 
+         main=paste("Population Densiaty of j, pulse period=(",pulse_period,")"), xlab="time(days)", ylab="Number of cells L-1")
+  }
+  dev.off()
+}
+
+Plot_all <- function(total, size_of_i, size_of_j, pulse_period, plot_start, plot_end){
+  jpeg (paste("si=", size_of_i, ", sj=", size_of_j,", pulse period=", pulse_period,".jpeg", sep=""), width=9600, height=5400, pointsize=80) 
+
+  if (plot_end == 0){  # determines the range of data plotted based on plot_start & plot_end
+    par(mfrow=c(2,3))
+    plot(total[,1], total[,2], type="l", main=paste("Population Density of i, pulse period=(",pulse_period,")"), 
+         xlab="time(days)", ylab="Number of cells L-1")
+    plot(total[,1], total[,4], type="l", main=paste("Internal Cellular Nutrient Quota of i, pulse period=(",pulse_period,")"), 
+         xlab="time(days)", ylab="mu mol nutrient L-1")
+    plot(total[,1], total[,6], type="l", main=paste("External Concentration of Nutrient, pulse period=(",pulse_period,")"), 
+         xlab="time(days)", ylab="mu mol L-1")
+    plot(total[,1], total[,3], type="l", main=paste("Population Density of j, pulse period=(",pulse_period,")"), 
+         xlab="time(days)", ylab="Number of cells L-1")
+    plot(total[,1], total[,5], type="l", main=paste("Internal Cellular Nutrient Quota of j, pulse period=(",pulse_period,")"), 
+         xlab="time(days)", ylab="mu mol nutrient L-1")
+  } else {
+    par(mfrow=c(2,3))
+    plot(total[plot_start:plot_end,1], total[plot_start:plot_end,2], type="l", 
+         main=paste("Population Density of i, pulse period=(",pulse_period,")"), xlab="time(days)", ylab="Number of cells L-1")
+    plot(total[plot_start:plot_end,1], total[plot_start:plot_end,4], type="l",
+         main=paste("Internal Cellular Nutrient Quota of i, pulse period=(",pulse_period,")"), xlab="time(days)", ylab="mu mol nutrient L-1")
+    plot(total[plot_start:plot_end,1], total[plot_start:plot_end,6], type="l", 
+         main=paste("External Concentration of Nutrient, pulse period=(",pulse_period,")"), xlab="time(days)", ylab="mu mol L-1")
+    plot(total[plot_start:plot_end,1], total[plot_start:plot_end,3], type="l", 
+         main=paste("Population Density of j, pulse period=(",pulse_period,")"), xlab="time(days)", ylab="Number of cells L-1")
+    plot(total[plot_start:plot_end,1], total[plot_start:plot_end,5], type="l", 
+         main=paste("Internal Cellular Nutrient Quota of j, pulse period=(",pulse_period,")"), xlab="time(days)", ylab="mu mol nutrient L-1")
+  }
+  dev.off()
+}
+```
+
+Initialising the default variable values
+```{r}
+# Note: keep these the same and then modify them by replacing specific variable values in later code
+# This is a vector of parameters that describe how cell size and temp affect the dynamical model parameters
+metaparms <- c(T0      = 293.15,           # for 20 degrees C
+               T       = 293.15,
+               EQmin   = -0.230,           # from line 115 suppmat Reuman et al 2013
+               eQmin   = 0.84,             # line 119 reuman et al 2013 supp mat
+               kQmin   = 1e-09,            # table 2 supp mat reuman et al 2013 (originally from edwards et al 2012)
+               eQmax   = 0.809,            # table 2 supp mat reuman et al 2013 (originally from montagnes & franklin 2001)
+               kQmax   = 10^-8.03,         # table 2 supp mat reuman et al 2013
+               EQmax   = 0,
+               EVmax   = 0.456,            # line 104 supp mat reuman et al 2013
+               eVmax   = 0.82,             # table 2 supp mat reuman et al 2013
+               kVmax   = 1e-08,            # table 2 supp mat reuman et al 2013 (originally from edwards et al 2012)
+               emu_max = -0.28,            # table 2 supp mat reuman et al 2013
+               kmu_max = 10^0.65,          # table 2 supp mat reuman et al 2013
+               Emu_max = 0.474,            # line 235 of rueman et al 2013
+               eH_up   = (1/3),            # table 2 supp mat reuman et al 2013
+               kH_up   = 10^-0.61,         # table 2 supp mat reuman et al 2013
+               EH_up   = 0.277,            # line 99 supp mat reuman et al 2013
+               km      = 0.01,             # one of the options from fig 2 supp mat
+               em      = 0,                # 0 for cell size independant sinking
+               Em      = 0.1781)           # fig 2 supp mat
+                        
+# model variables
+size_of_i         <- 1e03
+size_of_j         <- 1e06 
+
+ini_cond <- c(N_i  = 1000,   # initial population size of i
+              N_j  = 1000,
+              Q_i  = 0,      # only a place holder, Q_i & Q_j is calculated later inside Model_sim
+              Q_j  = 0,
+              R    = 40)     # initial external nutrient concentration 
+
+# variables for mixing event
+fraction_replaced  <- 0.3  # under methods in Litchman et al (2009) varies from 0.2-0.5, used values of 0.1, 0.3, 0.5 in models
+R_in               <- 40   # from litchman et al 2009 under methods, can vary from 0.05-0.95, used 40 in their model
+
+# variables for simulation time in days
+pulse_period       <- 14  
+
+# plot range 
+plot_start         <- 0 
+plot_end           <- 0  # (set plot_end=0 for whole plot)
+
+# extras
+output_folder_name <- "tester"  # use to create folder for graph output
+```
+
+## Model Simulation to look for coexistence between species i and j
+Looking for coexistence, by running through a range of sizes for species j and looking for increases in population density 
+```{r}
+cl <- makeCluster(detectCores()-1)
+clusterExport(cl, c("k", "dynamic_parms", "Pulse", "lsoda", "rcpp_ModelRHS"))
+pulse_period <- 15
+size_of_i <- 1e2
+
+# creates a series of sizes for species j to then compare against size if species i
+numbers <- NULL  
+num <- c(1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9)
+for (num in num){
+  numbers <- rbind(numbers, c(1, 2, 3, 4, 5, 6, 7, 8, 9)*num)
+}
+size_of_j <- numbers 
+
+out_times <- 5000
+Totals <- parLapply(cl, size_of_j, fun=Model_sim, metaparms=metaparms, size_of_i=size_of_i, ini_cond=ini_cond,
+                    fraction_replaced=fraction_replaced, R_in=R_in, pulse_period=pulse_period,
+                    output_folder_name=output_folder_name, out_times=out_times)
+all_Nj <- NULL
+for (i in 1:length(size_of_j)){
+all_Nj <- rbind(all_Nj, Totals[[i]]["N_j"])
+}
+plot(size_of_j , all_Nj, xlab="size of j", ylab="Population Density of j", log="xy")
+```
+Looking at at the plot there does not appear to be a particualr size of j that would indicate coexistance with size of i. In all cases the smaller species of pythoplankton i outcompetes with species j. They do coexist in real systems so the model needs tweaking or there are environmental situations outside of the scope of the model that allows for coexistance.
+
+## Benchmarking ODE solving speed between C++ and native R code
+Benchmarked to compare the C++ & R variation of the model only lsoda function
+```{r}
+times     <- seq(0, 1000, 1)
+size_of_i <- 1e2
+size_of_j <- 1e4
+d_parms_i <- dynamic_parms(size_of_i, metaparms)
+d_parms_j <- dynamic_parms(size_of_j, metaparms)
+ini_cond["Q_i"] <- median(d_parms_i["Qmax"], d_parms_i["Qmin"])
+ini_cond["Q_j"] <- median(d_parms_j["Qmax"], d_parms_j["Qmin"])
+
+bench <- microbenchmark(lsoda(y=ini_cond, times=times, func=ModelRHS, parms=0, d_parms_i=d_parms_i, d_parms_j=d_parms_j),
+                        lsoda(y=ini_cond, times=times, func=CmodelRHS2::rcpp_ModelRHS, parms=0, d_parms_i=d_parms_i, d_parms_j=d_parms_j),
+                        times=10)
+summary(bench)
+```
+
+## Testing parallelisation of code 
+Below are a few chunks of code that was used to run the code in parallel.
+
+Benchamark of running simulation in parallel splitting up the pulse periods in this case
+```{r warning=FALSE}
+cl <- makeCluster(detectCores())
+clusterExport(cl, c("k", "dynamic_parms", "Pulse", "lsoda", "rcpp_ModelRHS"))
+pulse_period <- c(14, 30, 50)
+out_times <- seq(0,5000,1)
+
+pulse_period <- as.matrix(pulse_period)
+
+bench <- microbenchmark(parLapply(cl, pulse_period, fun=Model_sim, metaparms=metaparms, size_of_i=size_of_i, size_of_j=size_of_j,
+                                  ini_cond=ini_cond, fraction_replaced=fraction_replaced, R_in=R_in,
+                                  output_folder_name=output_folder_name, out_times=out_times),
+                        apply(pulse_period, 1, FUN=Model_sim, metaparms=metaparms, size_of_i=size_of_i, size_of_j=size_of_j,
+                              ini_cond=ini_cond, fraction_replaced=fraction_replaced, R_in=R_in,
+                              output_folder_name=output_folder_name, out_times=out_times),
+                        times = 5)
+summary(bench)
+```
+Test for parallel processing using built in parallel package function parLapply
+```{r}
+Rprof("Rprof.out", memory.profiling=TRUE)
+cl <- makeCluster(detectCores()-1)  # creates a cluster defined by the number of cores avaialbe, leaving one free for user to control computer
+clusterExport(cl, c("k", "dynamic_parms", "Pulse", "lsoda", "rcpp_ModelRHS"))  # exports all the necessary functions to the cluster
+pulse_period <- c(14, 30, 50)
+out_times <- seq(0,1000,1)
+# parLapply is a fucntion from the inbuilt parallel package, it runs  Model_sim function with the vector of pulse_period provided, in this case
+# it simultaneously runs three iterations of Model_sim each with difffernt pulse_period and stores results in Totals
+Totals <- parLapply(cl, pulse_period, fun=Model_sim, metaparms=metaparms, size_of_i=size_of_i, size_of_j=size_of_j, ini_cond=ini_cond,
+                    fraction_replaced=fraction_replaced, R_in=R_in, output_folder_name=output_folder_name, out_times=out_times)
+
+Plot_pop(Totals[[1]], size_of_i, size_of_j, pulse_period[1], plot_start, plot_end)  # Totals[[1]] is for pulse_period 14
+Plot_pop(Totals[[2]], size_of_i, size_of_j, pulse_period[2], plot_start, plot_end)  # Totals[[2]] is for pulse_period 30
+Plot_pop(Totals[[3]], size_of_i, size_of_j, pulse_period[3], plot_start, plot_end)
+
+Rprof(NULL)
+summaryRprof("Rprof.out", memory = "both")
+```
